@@ -1,12 +1,15 @@
-use crate::bindings::ml_register::record_results_py;
-use crate::bindings::ml_register::run_python_function;
-use crate::bindings::ml_register::PY_MODULE_INFERENCE;
+use super::ml_register::record_results_py;
+use super::ml_register::run_python_function;
+use super::ml_register::PY_MODULE_INFERENCE;
 use crate::util;
 use pgrx::prelude::*;
+use serde::ser::SerializeMap;
+use serde::Serialize;
 use serde_json::json;
 use shared_memory::*;
 use std::collections::HashMap;
 use std::ffi::c_long;
+use std::ops::Index;
 use std::time::Instant;
 
 pub struct Model<'a> {
@@ -63,7 +66,48 @@ fn num_columns(dataset: &str) -> Result<i32, ()> {
     }
 }
 
-pub struct InferenceRunner {
+pub struct InferenceResult {
+    data: HashMap<&'static str, f64>,
+}
+
+impl InferenceResult {
+    pub fn new() -> InferenceResult {
+        InferenceResult {
+            data: HashMap::new(),
+        }
+    }
+
+    pub fn add(&mut self, k: &'static str, v: f64) {
+        self.data.insert(k, v);
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!(self.data)
+    }
+}
+
+impl Index<&str> for InferenceResult {
+    type Output = f64;
+
+    fn index(&self, index: &str) -> &Self::Output {
+        &self.data[index]
+    }
+}
+
+impl Serialize for InferenceResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.data.len()))?;
+        for (k, v) in &self.data {
+            map.serialize_entry(&k.to_string(), &v)?;
+        }
+        map.end()
+    }
+}
+
+pub struct InferenceInfo {
     dataset: String,
     condition: String,
     config_file: String,
@@ -71,11 +115,18 @@ pub struct InferenceRunner {
     model_path: String,
     sql: String,
     batch_size: i32,
-
-    result: HashMap<&'static str, f64>,
 }
 
-impl InferenceRunner {
+pub trait InferenceRunner {
+    fn run(&mut self) -> serde_json::Value;
+}
+
+pub struct SimpleRunner {
+    info: InferenceInfo,
+    result: InferenceResult,
+}
+
+impl SimpleRunner {
     pub fn new(
         dataset: String,
         condition: String,
@@ -84,39 +135,163 @@ impl InferenceRunner {
         model_path: String,
         sql: String,
         batch_size: i32,
-    ) -> InferenceRunner {
-        InferenceRunner {
-            dataset,
-            condition,
-            config_file,
-            col_cardinalities_file,
-            model_path,
-            sql,
-            batch_size,
-            result: HashMap::new(),
+    ) -> SimpleRunner {
+        SimpleRunner {
+            info: InferenceInfo {
+                dataset,
+                condition,
+                config_file,
+                col_cardinalities_file,
+                model_path,
+                sql,
+                batch_size,
+            },
+            result: InferenceResult::new(),
         }
     }
+}
 
-    fn add_result(&mut self, k: &'static str, v: f64) {
-        self.result.insert(k, v);
-    }
-
-    fn json_result(&self) -> serde_json::Value {
-        serde_json::json!(self.result)
-    }
-
-    pub fn run_shared_memory(&mut self) -> serde_json::Value {
+impl InferenceRunner for SimpleRunner {
+    fn run(&mut self) -> serde_json::Value {
         let overall_start_time = Instant::now();
 
+        //     let mut last_id = 0;
+
         // Step 1: load model and columns etc
-        self.add_result(
+        self.result.add(
             "model_init_time",
             util::record_time(|_| {
                 Model::new(
-                    &self.condition,
-                    &self.config_file,
-                    &self.col_cardinalities_file,
-                    &self.model_path,
+                    &self.info.condition,
+                    &self.info.config_file,
+                    &self.info.col_cardinalities_file,
+                    &self.info.model_path,
+                )
+                .init()
+            }),
+        );
+
+        // Step 2: query data via SPI
+        let mut all_rows = Vec::new();
+
+        let time = util::record_time(|start_time| {
+            let _ = Spi::connect(|client| {
+                let query = format!(
+                    "SELECT * FROM {}_int_train {} LIMIT {}",
+                    self.info.dataset, self.info.sql, self.info.batch_size
+                );
+                let mut cursor = client.open_cursor(&query, None);
+                let table = match cursor.fetch(self.info.batch_size as c_long) {
+                    Ok(table) => table,
+                    Err(e) => return Err(e.to_string()),
+                };
+                self.result
+                    .add("data_query_time_spi", util::time_since(start_time));
+
+                // todo: nl: this part can must be optimized, since i go through all of those staff.
+                for row in table.into_iter() {
+                    for i in 3..=row.columns() {
+                        match row.get::<i32>(i) {
+                            Ok(Some(val)) => all_rows.push(val), // Handle the case when a valid i32 is obtained
+                            Ok(None) => {
+                                // Handle the case when the value is missing or erroneous
+                                // For example, you can add a default value, like -1
+                                all_rows.push(-1);
+                            }
+                            Err(e) => {
+                                // Handle the error, e.g., log it or handle it in some way
+                                eprintln!("Error fetching value: {:?}", e);
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            });
+        });
+        self.result.add("data_query_time", time);
+
+        let mini_batch_json = serde_json::to_string(&all_rows).unwrap();
+        let mini_batch_json_str = mini_batch_json.as_str();
+
+        // Step 3: model evaluate in Python
+        self.result.add(
+            "python_compute_time",
+            util::record_time(|_| {
+                let mut eva_task_map = HashMap::new();
+                eva_task_map.insert("config_file", self.info.config_file.clone());
+                eva_task_map.insert("mini_batch", mini_batch_json_str.to_string());
+                eva_task_map.insert("spi_seconds", self.result["data_query_time"].to_string());
+
+                let eva_task_json = json!(eva_task_map).to_string(); // Corrected this line
+
+                run_python_function(
+                    &PY_MODULE_INFERENCE,
+                    &eva_task_json,
+                    "model_inference_compute",
+                );
+            }),
+        );
+
+        let overall_elapsed_time = util::time_since(&overall_start_time);
+        let diff_time = self.result["model_init_time"]
+            + self.result["data_query_time"]
+            + self.result["python_compute_time"]
+            - overall_elapsed_time;
+
+        self.result
+            .add("overall_query_latency", overall_elapsed_time);
+        self.result.add("diff", diff_time);
+
+        record_results_py(&self.result);
+
+        self.result.json()
+    }
+}
+
+pub struct SharedMemoryRunner {
+    info: InferenceInfo,
+    result: InferenceResult,
+}
+
+impl SharedMemoryRunner {
+    pub fn new(
+        dataset: String,
+        condition: String,
+        config_file: String,
+        col_cardinalities_file: String,
+        model_path: String,
+        sql: String,
+        batch_size: i32,
+    ) -> SharedMemoryRunner {
+        SharedMemoryRunner {
+            info: InferenceInfo {
+                dataset,
+                condition,
+                config_file,
+                col_cardinalities_file,
+                model_path,
+                sql,
+                batch_size,
+            },
+            result: InferenceResult::new(),
+        }
+    }
+}
+
+impl InferenceRunner for SharedMemoryRunner {
+    fn run(&mut self) -> serde_json::Value {
+        let overall_start_time: Instant = Instant::now();
+
+        // Step 1: load model and columns etc
+        self.result.add(
+            "model_init_time",
+            util::record_time(|_| {
+                Model::new(
+                    &self.info.condition,
+                    &self.info.config_file,
+                    &self.info.col_cardinalities_file,
+                    &self.info.model_path,
                 )
                 .init()
             }),
@@ -129,10 +304,10 @@ impl InferenceRunner {
             let results: Result<Vec<Vec<String>>, String> = Spi::connect(|client| {
                 let query = format!(
                     "SELECT * FROM {}_train {} LIMIT {}",
-                    self.dataset, self.sql, self.batch_size
+                    self.info.dataset, self.info.sql, self.info.batch_size
                 );
                 let mut cursor = client.open_cursor(&query, None);
-                let table = match cursor.fetch(self.batch_size as c_long) {
+                let table = match cursor.fetch(self.info.batch_size as c_long) {
                     Ok(table) => table,
                     Err(e) => return Err(e.to_string()), // Convert the error to a string and return
                 };
@@ -194,11 +369,11 @@ impl InferenceRunner {
                 }
             }
         });
-        self.add_result("data_query_time", time);
+        self.result.add("data_query_time", time);
 
         let mini_batch_json = tup_table.to_string();
 
-        self.add_result(
+        self.result.add(
             "data_copy",
             util::record_time(|_| {
                 // Set an identifier for the shared memory
@@ -222,11 +397,11 @@ impl InferenceRunner {
         );
 
         // Step 3: model evaluate in Python
-        self.add_result(
+        self.result.add(
             "python_compute_time",
             util::record_time(|_| {
                 let mut eva_task_map = HashMap::new();
-                eva_task_map.insert("config_file", self.config_file.clone());
+                eva_task_map.insert("config_file", self.info.config_file.clone());
                 eva_task_map.insert("spi_seconds", self.result["data_query_time"].to_string());
 
                 let eva_task_json = json!(eva_task_map).to_string(); // Corrected this line
@@ -247,120 +422,58 @@ impl InferenceRunner {
             - overall_elapsed_time;
 
         self.result
-            .insert("overall_query_latency", overall_elapsed_time);
-        self.result.insert("diff", diff_time);
+            .add("overall_query_latency", overall_elapsed_time);
+        self.result.add("diff", diff_time);
 
-        self.json_result()
+        self.result.json()
     }
+}
 
-    pub fn run(&mut self) -> serde_json::Value {
-        let overall_start_time = Instant::now();
+pub struct SharedMemoryWriteOnceRunner {
+    info: InferenceInfo,
+    result: InferenceResult,
+}
 
-        //     let mut last_id = 0;
-
-        // Step 1: load model and columns etc
-        self.add_result(
-            "model_init_time",
-            util::record_time(|_| {
-                Model::new(
-                    &self.condition,
-                    &self.config_file,
-                    &self.col_cardinalities_file,
-                    &self.model_path,
-                )
-                .init()
-            }),
-        );
-
-        // Step 2: query data via SPI
-        let mut all_rows = Vec::new();
-
-        let time = util::record_time(|start_time| {
-            let _ = Spi::connect(|client| {
-                let query = format!(
-                    "SELECT * FROM {}_int_train {} LIMIT {}",
-                    self.dataset, self.sql, self.batch_size
-                );
-                let mut cursor = client.open_cursor(&query, None);
-                let table = match cursor.fetch(self.batch_size as c_long) {
-                    Ok(table) => table,
-                    Err(e) => return Err(e.to_string()),
-                };
-                self.add_result("data_query_time_spi", util::time_since(start_time));
-
-                // todo: nl: this part can must be optimized, since i go through all of those staff.
-                for row in table.into_iter() {
-                    for i in 3..=row.columns() {
-                        match row.get::<i32>(i) {
-                            Ok(Some(val)) => all_rows.push(val), // Handle the case when a valid i32 is obtained
-                            Ok(None) => {
-                                // Handle the case when the value is missing or erroneous
-                                // For example, you can add a default value, like -1
-                                all_rows.push(-1);
-                            }
-                            Err(e) => {
-                                // Handle the error, e.g., log it or handle it in some way
-                                eprintln!("Error fetching value: {:?}", e);
-                            }
-                        }
-                    }
-                }
-
-                Ok(())
-            });
-        });
-        self.add_result("data_query_time", time);
-
-        let mini_batch_json = serde_json::to_string(&all_rows).unwrap();
-        let mini_batch_json_str = mini_batch_json.as_str();
-
-        // Step 3: model evaluate in Python
-        self.add_result(
-            "python_compute_time",
-            util::record_time(|_| {
-                let mut eva_task_map = HashMap::new();
-                eva_task_map.insert("config_file", self.config_file.clone());
-                eva_task_map.insert("mini_batch", mini_batch_json_str.to_string());
-                eva_task_map.insert("spi_seconds", self.result["data_query_time"].to_string());
-
-                let eva_task_json = json!(eva_task_map).to_string(); // Corrected this line
-
-                run_python_function(
-                    &PY_MODULE_INFERENCE,
-                    &eva_task_json,
-                    "model_inference_compute",
-                );
-            }),
-        );
-
-        let overall_elapsed_time = util::time_since(&overall_start_time);
-        let diff_time = self.result["model_init_time"]
-            + self.result["data_query_time"]
-            + self.result["python_compute_time"]
-            - overall_elapsed_time;
-
-        self.add_result("overall_query_latency", overall_elapsed_time);
-        self.add_result("diff", diff_time);
-
-        record_results_py(&self.result);
-
-        self.json_result()
+impl SharedMemoryWriteOnceRunner {
+    pub fn new(
+        dataset: String,
+        condition: String,
+        config_file: String,
+        col_cardinalities_file: String,
+        model_path: String,
+        sql: String,
+        batch_size: i32,
+    ) -> SharedMemoryWriteOnceRunner {
+        SharedMemoryWriteOnceRunner {
+            info: InferenceInfo {
+                dataset,
+                condition,
+                config_file,
+                col_cardinalities_file,
+                model_path,
+                sql,
+                batch_size,
+            },
+            result: InferenceResult::new(),
+        }
     }
+}
 
-    pub fn run_shared_memory_write_once(&mut self) -> serde_json::Value {
+impl InferenceRunner for SharedMemoryWriteOnceRunner {
+    fn run(&mut self) -> serde_json::Value {
         let overall_start_time = Instant::now();
 
         let mut last_id = 0;
 
         // Step 1: load model and columns etc
-        self.add_result(
+        self.result.add(
             "model_init_time",
             util::record_time(|_| {
                 Model::new(
-                    &self.condition,
-                    &self.config_file,
-                    &self.col_cardinalities_file,
-                    &self.model_path,
+                    &self.info.condition,
+                    &self.info.config_file,
+                    &self.info.col_cardinalities_file,
+                    &self.info.model_path,
                 )
                 .init()
             }),
@@ -374,14 +487,14 @@ impl InferenceRunner {
 
             // Pre-allocate a size for shared memory (this might need some logic to determine a reasonable size)
             let avg_row_size = 120;
-            let shmem_size = (1.5 * (avg_row_size * self.batch_size as usize) as f64) as usize;
+            let shmem_size = (1.5 * (avg_row_size * self.info.batch_size as usize) as f64) as usize;
             ShmemConf::new()
                 .size(shmem_size)
                 .os_id(shmem_name)
                 .create()
                 .unwrap()
         });
-        self.add_result("mem_allocate_time", mem_allocate_time);
+        self.result.add("mem_allocate_time", mem_allocate_time);
 
         let shmem_ptr = my_shmem.as_ptr() as *mut u8;
         let shmem_size = my_shmem.len();
@@ -390,15 +503,16 @@ impl InferenceRunner {
             let _ = Spi::connect(|client| {
                 let query = format!(
                     "SELECT * FROM {}_train {} LIMIT {}",
-                    self.dataset, self.sql, self.batch_size
+                    self.info.dataset, self.info.sql, self.info.batch_size
                 );
                 let mut cursor = client.open_cursor(&query, None);
-                let table = match cursor.fetch(self.batch_size as c_long) {
+                let table = match cursor.fetch(self.info.batch_size as c_long) {
                     Ok(table) => table,
                     Err(e) => return Err(e.to_string()),
                 };
 
-                self.add_result("data_query_time_spi", util::time_since(start_time));
+                self.result
+                    .add("data_query_time_spi", util::time_since(start_time));
 
                 let mut offset = 0; // Keep track of how much we've written to shared memory
 
@@ -483,14 +597,14 @@ impl InferenceRunner {
                 Ok(())
             });
         });
-        self.add_result("data_query_time", time);
+        self.result.add("data_query_time", time);
 
         // Step 3: model evaluate in Python
-        self.add_result(
+        self.result.add(
             "python_compute_time",
             util::record_time(|_| {
                 let mut eva_task_map = HashMap::new();
-                eva_task_map.insert("config_file", self.config_file.clone());
+                eva_task_map.insert("config_file", self.info.config_file.clone());
                 eva_task_map.insert("spi_seconds", self.result["data_query_time"].to_string());
 
                 let eva_task_json = json!(eva_task_map).to_string(); // Corrected this line
@@ -509,28 +623,61 @@ impl InferenceRunner {
             + self.result["python_compute_time"]
             - overall_elapsed_time;
 
-        self.add_result("overall_query_latency", overall_elapsed_time);
-        self.add_result("diff", diff_time);
+        self.result
+            .add("overall_query_latency", overall_elapsed_time);
+        self.result.add("diff", diff_time);
 
         record_results_py(&self.result);
 
-        self.json_result()
+        self.result.json()
     }
+}
 
-    pub fn run_shared_memory_write_once_int_exp(&mut self) -> serde_json::Value {
-        let num_columns: i32 = num_columns(&self.dataset).unwrap();
+pub struct SharedMemoryWriteOnceIntExpRunner {
+    info: InferenceInfo,
+    result: InferenceResult,
+}
+
+impl SharedMemoryWriteOnceIntExpRunner {
+    pub fn new(
+        dataset: String,
+        condition: String,
+        config_file: String,
+        col_cardinalities_file: String,
+        model_path: String,
+        sql: String,
+        batch_size: i32,
+    ) -> SharedMemoryWriteOnceIntExpRunner {
+        SharedMemoryWriteOnceIntExpRunner {
+            info: InferenceInfo {
+                dataset,
+                condition,
+                config_file,
+                col_cardinalities_file,
+                model_path,
+                sql,
+                batch_size,
+            },
+            result: InferenceResult::new(),
+        }
+    }
+}
+
+impl InferenceRunner for SharedMemoryWriteOnceIntExpRunner {
+    fn run(&mut self) -> serde_json::Value {
+        let num_columns: i32 = num_columns(&self.info.dataset).unwrap();
 
         let overall_start_time = Instant::now();
 
         /* load model and columns etc */
-        self.add_result(
+        self.result.add(
             "model_init_time",
             util::record_time(|_| {
                 Model::new(
-                    &self.condition,
-                    &self.config_file,
-                    &self.col_cardinalities_file,
-                    &self.model_path,
+                    &self.info.condition,
+                    &self.info.config_file,
+                    &self.info.col_cardinalities_file,
+                    &self.info.model_path,
                 )
                 .init()
             }),
@@ -543,19 +690,20 @@ impl InferenceRunner {
             let _ = Spi::connect(|client| {
                 let query = format!(
                     "SELECT * FROM {}_int_train {} LIMIT {}",
-                    self.dataset, self.sql, self.batch_size
+                    self.info.dataset, self.info.sql, self.info.batch_size
                 );
                 let mut cursor = client.open_cursor(&query, None);
-                let table = match cursor.fetch(self.batch_size as c_long) {
+                let table = match cursor.fetch(self.info.batch_size as c_long) {
                     Ok(table) => table,
                     Err(e) => return Err(e.to_string()),
                 };
 
-                self.add_result("data_query_time_spi", util::time_since(start_time));
+                self.result
+                    .add("data_query_time_spi", util::time_since(start_time));
 
                 let mut time: f64 = 0.0;
                 // todo: nl: this part can must be optimized, since i go through all of those staff.
-                self.add_result(
+                self.result.add(
                     "data_query_time3",
                     util::record_time_move(|_| {
                         for row in table.into_iter() {
@@ -569,13 +717,13 @@ impl InferenceRunner {
                         }
                     }),
                 );
-                self.add_result("data_query_time2", time);
+                self.result.add("data_query_time2", time);
 
                 // Return OK or some status
                 Ok(())
             });
         });
-        self.add_result("data_query_time", time);
+        self.result.add("data_query_time", time);
 
         /* log the query datas */
         // let serialized_row = serde_json::to_string(&all_rows).unwrap();
@@ -600,16 +748,16 @@ impl InferenceRunner {
                 );
             }
         });
-        self.add_result("mem_allocate_time", mem_allocate_time);
+        self.result.add("mem_allocate_time", mem_allocate_time);
 
         // Step 3: model evaluate in Python
-        self.add_result(
+        self.result.add(
             "python_compute_time",
             util::record_time(|_| {
                 let mut eva_task_map = HashMap::new();
-                eva_task_map.insert("config_file", self.config_file.clone());
+                eva_task_map.insert("config_file", self.info.config_file.clone());
                 eva_task_map.insert("spi_seconds", self.result["data_query_time"].to_string());
-                eva_task_map.insert("rows", self.batch_size.to_string());
+                eva_task_map.insert("rows", self.info.batch_size.to_string());
 
                 let eva_task_json = json!(eva_task_map).to_string(); // Corrected this line
 
@@ -627,28 +775,61 @@ impl InferenceRunner {
             + self.result["python_compute_time"]
             - overall_elapsed_time;
 
-        self.add_result("overall_query_latency", overall_elapsed_time);
-        self.add_result("diff", diff_time);
+        self.result
+            .add("overall_query_latency", overall_elapsed_time);
+        self.result.add("diff", diff_time);
 
         record_results_py(&self.result);
 
-        self.json_result()
+        self.result.json()
     }
+}
 
-    pub fn run_shared_memory_write_once_int(&mut self) -> serde_json::Value {
-        let num_columns: i32 = num_columns(&self.dataset).unwrap();
+pub struct SharedMemoryWriteOnceIntRunner {
+    info: InferenceInfo,
+    result: InferenceResult,
+}
+
+impl SharedMemoryWriteOnceIntRunner {
+    pub fn new(
+        dataset: String,
+        condition: String,
+        config_file: String,
+        col_cardinalities_file: String,
+        model_path: String,
+        sql: String,
+        batch_size: i32,
+    ) -> SharedMemoryWriteOnceIntRunner {
+        SharedMemoryWriteOnceIntRunner {
+            info: InferenceInfo {
+                dataset,
+                condition,
+                config_file,
+                col_cardinalities_file,
+                model_path,
+                sql,
+                batch_size,
+            },
+            result: InferenceResult::new(),
+        }
+    }
+}
+
+impl InferenceRunner for SharedMemoryWriteOnceIntRunner {
+    fn run(&mut self) -> serde_json::Value {
+        let num_columns: i32 = num_columns(&self.info.dataset).unwrap();
 
         let overall_start_time = Instant::now();
 
         // Step 1: load model and columns etc
-        self.add_result(
+        self.result.add(
             "model_init_time",
             util::record_time(|_| {
                 Model::new(
-                    &self.condition,
-                    &self.config_file,
-                    &self.col_cardinalities_file,
-                    &self.model_path,
+                    &self.info.condition,
+                    &self.info.config_file,
+                    &self.info.col_cardinalities_file,
+                    &self.info.model_path,
                 )
                 .init()
             }),
@@ -661,18 +842,19 @@ impl InferenceRunner {
             let _ = Spi::connect(|client| {
                 let query = format!(
                     "SELECT * FROM {}_int_train {} LIMIT {}",
-                    self.dataset, self.sql, self.batch_size
+                    self.info.dataset, self.info.sql, self.info.batch_size
                 );
                 let mut cursor = client.open_cursor(&query, None);
-                let table = match cursor.fetch(self.batch_size as c_long) {
+                let table = match cursor.fetch(self.info.batch_size as c_long) {
                     Ok(table) => table,
                     Err(e) => return Err(e.to_string()),
                 };
 
-                self.add_result("data_query_time_spi", util::time_since(start_time));
+                self.result
+                    .add("data_query_time_spi", util::time_since(start_time));
 
                 // todo: nl: this part can must be optimized, since i go through all of those staff.
-                self.add_result(
+                self.result.add(
                     "data_type_convert_time",
                     util::record_time_move(|_| {
                         for row in table.into_iter() {
@@ -689,14 +871,14 @@ impl InferenceRunner {
                 Ok(())
             });
         });
-        self.add_result("data_query_time", time);
+        self.result.add("data_query_time", time);
 
         // log the query datas
         // let serialized_row = serde_json::to_string(&all_rows).unwrap();
         // response_log.insert("query_data", serialized_row);
 
         // Step 3: Putting all data to he shared memory
-        self.add_result(
+        self.result.add(
             "mem_allocate_time",
             util::record_time(|_| {
                 let shmem_name: &str = "my_shared_memory";
@@ -719,13 +901,13 @@ impl InferenceRunner {
         );
 
         // Step 3: model evaluate in Python
-        self.add_result(
+        self.result.add(
             "python_compute_time",
             util::record_time(|_| {
                 let mut eva_task_map = HashMap::new();
-                eva_task_map.insert("config_file", self.config_file.clone());
+                eva_task_map.insert("config_file", self.info.config_file.clone());
                 eva_task_map.insert("spi_seconds", self.result["data_query_time"].to_string());
-                eva_task_map.insert("rows", self.batch_size.to_string());
+                eva_task_map.insert("rows", self.info.batch_size.to_string());
 
                 let eva_task_json = json!(eva_task_map).to_string(); // Corrected this line
 
@@ -743,11 +925,12 @@ impl InferenceRunner {
             + self.result["python_compute_time"]
             - overall_elapsed_time;
 
-        self.add_result("overall_query_latency", overall_elapsed_time);
-        self.add_result("diff", diff_time);
+        self.result
+            .add("overall_query_latency", overall_elapsed_time);
+        self.result.add("diff", diff_time);
 
         record_results_py(&self.result);
 
-        self.json_result()
+        self.result.json()
     }
 }

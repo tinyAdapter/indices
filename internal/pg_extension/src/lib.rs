@@ -1,5 +1,6 @@
 use pgrx::prelude::*;
 pgrx::pg_module_magic!();
+use bindings::inference::*;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -204,7 +205,7 @@ pub fn run_inference(
     sql: String,
     batch_size: i32,
 ) -> String {
-    let mut runner = bindings::inference::InferenceRunner::new(
+    let mut runner = SimpleRunner::new(
         dataset,
         condition,
         config_file,
@@ -230,7 +231,7 @@ pub fn run_inference_shared(
     sql: String,
     batch_size: i32,
 ) -> String {
-    let mut runner = bindings::inference::InferenceRunner::new(
+    let mut runner = SharedMemoryRunner::new(
         dataset,
         condition,
         config_file,
@@ -240,7 +241,7 @@ pub fn run_inference_shared(
         batch_size,
     );
 
-    runner.run_shared_memory().to_string()
+    runner.run().to_string()
 }
 
 // Model Inference
@@ -256,7 +257,7 @@ pub fn inference_shared_write_once(
     sql: String,
     batch_size: i32,
 ) -> String {
-    let mut runner = bindings::inference::InferenceRunner::new(
+    let mut runner = SharedMemoryWriteOnceRunner::new(
         dataset,
         condition,
         config_file,
@@ -266,7 +267,7 @@ pub fn inference_shared_write_once(
         batch_size,
     );
 
-    runner.run_shared_memory_write_once().to_string()
+    runner.run().to_string()
 }
 
 // Model Inference
@@ -282,7 +283,7 @@ pub fn inference_shared_write_once_int(
     sql: String,
     batch_size: i32,
 ) -> String {
-    let mut runner = bindings::inference::InferenceRunner::new(
+    let mut runner = SharedMemoryWriteOnceIntRunner::new(
         dataset,
         condition,
         config_file,
@@ -292,7 +293,7 @@ pub fn inference_shared_write_once_int(
         batch_size,
     );
 
-    runner.run_shared_memory_write_once_int().to_string()
+    runner.run().to_string()
 }
 
 // Model Inference

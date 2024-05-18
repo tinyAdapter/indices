@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-
 use log::error;
 use once_cell::sync::Lazy;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
+
+use super::inference::InferenceResult;
 
 pub fn run_python_function(
     py_module: &Lazy<Py<PyModule>>,
@@ -56,7 +56,7 @@ pub static PY_MODULE_INFERENCE: Lazy<Py<PyModule>> = Lazy::new(|| {
     })
 });
 
-pub fn record_results_py(results: &HashMap<&str, f64>) {
+pub fn record_results_py(results: &InferenceResult) {
     run_python_function(
         &PY_MODULE_INFERENCE,
         &serde_json::json!(results).to_string(),
