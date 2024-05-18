@@ -204,7 +204,7 @@ pub fn run_inference(
     sql: String,
     batch_size: i32,
 ) -> String {
-    let runner = bindings::inference::InferenceRunner::new(
+    let mut runner = bindings::inference::InferenceRunner::new(
         dataset,
         condition,
         config_file,
@@ -230,7 +230,7 @@ pub fn run_inference_shared(
     sql: String,
     batch_size: i32,
 ) -> String {
-    let runner = bindings::inference::InferenceRunner::new(
+    let mut runner = bindings::inference::InferenceRunner::new(
         dataset,
         condition,
         config_file,
@@ -256,7 +256,7 @@ pub fn inference_shared_write_once(
     sql: String,
     batch_size: i32,
 ) -> String {
-    let runner = bindings::inference::InferenceRunner::new(
+    let mut runner = bindings::inference::InferenceRunner::new(
         dataset,
         condition,
         config_file,
@@ -282,7 +282,7 @@ pub fn inference_shared_write_once_int(
     sql: String,
     batch_size: i32,
 ) -> String {
-    let runner = bindings::inference::InferenceRunner::new(
+    let mut runner = bindings::inference::InferenceRunner::new(
         dataset,
         condition,
         config_file,
